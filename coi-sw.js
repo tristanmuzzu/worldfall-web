@@ -9,6 +9,10 @@ self.addEventListener('fetch', (event) => {
 	event.respondWith(fetch(request).then((response) => {
 		if (response.status === 0) return response;
 		const headers = new Headers(response.headers);
+		// The body is already decoded; the host's compressed length and
+		// encoding no longer describe it.
+		headers.delete('Content-Encoding');
+		headers.delete('Content-Length');
 		headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
 		headers.set('Cross-Origin-Opener-Policy', 'same-origin');
 		headers.set('Cross-Origin-Resource-Policy', 'same-origin');

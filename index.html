@@ -142,19 +142,38 @@ function startHostedGame(options) {
 				offset += value.length;
 			}
 		})();
-		const parts = HOSTED_PACK.parts.map((name) => fetch(name).then((response) => {
-			if (!response.ok) throw new Error('Could not download ' + name + ' (' + response.status + ')');
-			return response;
-		}));
-		for (const part of parts) {
-			const reader = (await part).body.getReader();
-			for (;;) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				packLoaded += value.length;
-				report();
-				await writer.write(value);
+		// Each part downloads whole (retried up to four times) before it is
+		// inflated, so a dropped connection costs one part, not the game.
+		const partLoaded = HOSTED_PACK.parts.map(() => 0);
+		async function download(name, index) {
+			for (let attempt = 1; ; attempt++) {
+				try {
+					const response = await fetch(name, attempt > 1 ? { cache: 'reload' } : {});
+					if (!response.ok) throw new Error('HTTP ' + response.status);
+					const reader = response.body.getReader();
+					const chunks = [];
+					for (;;) {
+						const { done, value } = await reader.read();
+						if (done) break;
+						chunks.push(value);
+						packLoaded += value.length;
+						partLoaded[index] += value.length;
+						report();
+					}
+					return chunks;
+				} catch (error) {
+					packLoaded -= partLoaded[index];
+					partLoaded[index] = 0;
+					report();
+					console.warn('Download of ' + name + ' failed (attempt ' + attempt + '):', error);
+					if (attempt >= 4) throw new Error('Could not download ' + name + ': ' + error.message);
+					await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+				}
 			}
+		}
+		const parts = HOSTED_PACK.parts.map(download);
+		for (const part of parts) {
+			for (const chunk of await part) await writer.write(chunk);
 		}
 		await writer.close();
 		await reading;
