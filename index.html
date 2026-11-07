@@ -115,7 +115,7 @@ const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":16,"
 const GODOT_THREADS_ENABLED = true;
 const __args=new URLSearchParams(location.search).get("args"); if(__args) GODOT_CONFIG.args=__args.split(",");
 const engine = new Engine(GODOT_CONFIG);
-const HOSTED_PACK = {"parts": ["index.pck.gz.000", "index.pck.gz.001", "index.pck.gz.002", "index.pck.gz.003"], "size": 290301612, "compressed": 143764041};
+const HOSTED_PACK = {"parts": ["index.pck.000.gz", "index.pck.001.gz", "index.pck.002.gz", "index.pck.003.gz", "index.pck.004.gz", "index.pck.005.gz"], "size": 290301612, "compressed": 143764041};
 // Fetch the gzip parts of the pack in parallel, inflate them in order and
 // start the engine with the pack preloaded (replaces Engine.startGame()).
 function startHostedGame(options) {
@@ -142,32 +142,38 @@ function startHostedGame(options) {
 				offset += value.length;
 			}
 		})();
-		// Each part downloads whole (retried up to four times) before it is
-		// inflated, so a dropped connection costs one part, not the game.
-		const partLoaded = HOSTED_PACK.parts.map(() => 0);
-		async function download(name, index) {
+		// Chrome drops large downloads from GitHub Pages now and then
+		// ("network error" part way through), so each part downloads whole
+		// before it is inflated, and a dropped download resumes with a Range
+		// request from the last byte received.
+		async function download(name) {
+			const chunks = [];
+			let received = 0;
 			for (let attempt = 1; ; attempt++) {
 				try {
-					const response = await fetch(name, attempt > 1 ? { cache: 'reload' } : {});
+					const resume = received > 0;
+					const response = await fetch(name, resume ? { headers: { Range: 'bytes=' + received + '-' }, cache: 'no-store' } : {});
 					if (!response.ok) throw new Error('HTTP ' + response.status);
+					if (resume && response.status !== 206) {
+						// The range was ignored: start this part again.
+						packLoaded -= received;
+						received = 0;
+						chunks.length = 0;
+					}
 					const reader = response.body.getReader();
-					const chunks = [];
 					for (;;) {
 						const { done, value } = await reader.read();
 						if (done) break;
 						chunks.push(value);
+						received += value.length;
 						packLoaded += value.length;
-						partLoaded[index] += value.length;
 						report();
 					}
 					return chunks;
 				} catch (error) {
-					packLoaded -= partLoaded[index];
-					partLoaded[index] = 0;
-					report();
-					console.warn('Download of ' + name + ' failed (attempt ' + attempt + '):', error);
-					if (attempt >= 4) throw new Error('Could not download ' + name + ': ' + error.message);
-					await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+					console.warn('Download of ' + name + ' interrupted at ' + received + ' bytes (attempt ' + attempt + '):', error);
+					if (attempt >= 8) throw new Error('Could not download ' + name + ': ' + error.message);
+					await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
 				}
 			}
 		}
