@@ -115,18 +115,70 @@ const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":16,"
 const GODOT_THREADS_ENABLED = true;
 const __args=new URLSearchParams(location.search).get("args"); if(__args) GODOT_CONFIG.args=__args.split(",");
 const engine = new Engine(GODOT_CONFIG);
-const HOSTED_PACK = {"parts": ["index.pck.000.gz", "index.pck.001.gz", "index.pck.002.gz", "index.pck.003.gz", "index.pck.004.gz", "index.pck.005.gz"], "size": 290301612, "compressed": 143764041};
-// Fetch the gzip parts of the pack in parallel, inflate them in order and
-// start the engine with the pack preloaded (replaces Engine.startGame()).
+const HOSTED_PACK = {"parts": ["index.pck.000.gz", "index.pck.001.gz", "index.pck.002.gz", "index.pck.003.gz", "index.pck.004.gz", "index.pck.005.gz"], "size": 290301612, "compressed": 143764041, "wasm": "index.wasm.gz", "wasmCompressed": 9866248};
+// Chrome drops large downloads from GitHub Pages now and then ("network
+// error" part way through), above all files the host compresses on the fly.
+// The engine and the pack are therefore served as .gz files (sent as-is),
+// each downloaded whole with a Range request resuming from the last byte
+// received, and a download that goes silent for 20 s is restarted the same way.
+async function hostedDownload(name, onBytes) {
+	const chunks = [];
+	let received = 0;
+	for (let attempt = 1; ; attempt++) {
+		const abort = new AbortController();
+		let stall = setTimeout(() => abort.abort(new Error('stalled')), 20000);
+		try {
+			const resume = received > 0;
+			const response = await fetch(name, resume
+				? { headers: { Range: 'bytes=' + received + '-' }, cache: 'no-store', signal: abort.signal }
+				: { signal: abort.signal });
+			if (!response.ok) throw new Error('HTTP ' + response.status);
+			if (resume && response.status !== 206) {
+				// The range was ignored: start this file again.
+				onBytes(-received);
+				received = 0;
+				chunks.length = 0;
+			}
+			const reader = response.body.getReader();
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				clearTimeout(stall);
+				stall = setTimeout(() => abort.abort(new Error('stalled')), 20000);
+				chunks.push(value);
+				received += value.length;
+				onBytes(value.length);
+			}
+			clearTimeout(stall);
+			return chunks;
+		} catch (error) {
+			clearTimeout(stall);
+			console.warn('Download of ' + name + ' interrupted at ' + received + ' bytes (attempt ' + attempt + '):', error);
+			if (attempt >= 10) throw new Error('Could not download ' + name + ': ' + error.message);
+			await new Promise((resolve) => setTimeout(resolve, 500 * Math.min(attempt, 6)));
+		}
+	}
+}
+
+// Replaces Engine.startGame(): the engine's own request for index.wasm is
+// answered from the resumable .gz download, the pack parts are fetched in
+// parallel and inflated in order, and the pack is preloaded before start.
 function startHostedGame(options) {
 	const exe = GODOT_CONFIG.executable;
 	const pack = exe + '.pck';
-	const wasmSize = GODOT_CONFIG.fileSizes[exe + '.wasm'];
-	const total = wasmSize + HOSTED_PACK.compressed;
-	let wasmLoaded = 0;
-	let packLoaded = 0;
-	const report = () => options.onProgress(Math.min(wasmLoaded, wasmSize) + packLoaded, total);
-	engine.config.update({ onProgress: (current) => { wasmLoaded = current; report(); } });
+	const total = HOSTED_PACK.wasmCompressed + HOSTED_PACK.compressed;
+	let loaded = 0;
+	const count = (bytes) => { loaded += bytes; options.onProgress(loaded, total); };
+	const nativeFetch = window.fetch.bind(window);
+	window.fetch = function (input, init) {
+		if (input === exe + '.wasm') {
+			window.fetch = nativeFetch;
+			return hostedDownload(HOSTED_PACK.wasm, count).then((chunks) => new Response(
+				new Blob(chunks).stream().pipeThrough(new DecompressionStream('gzip')),
+				{ headers: { 'Content-Type': 'application/wasm' } }));
+		}
+		return nativeFetch(input, init);
+	};
 	async function loadPack() {
 		const inflate = new DecompressionStream('gzip');
 		const writer = inflate.writable.getWriter();
@@ -142,42 +194,7 @@ function startHostedGame(options) {
 				offset += value.length;
 			}
 		})();
-		// Chrome drops large downloads from GitHub Pages now and then
-		// ("network error" part way through), so each part downloads whole
-		// before it is inflated, and a dropped download resumes with a Range
-		// request from the last byte received.
-		async function download(name) {
-			const chunks = [];
-			let received = 0;
-			for (let attempt = 1; ; attempt++) {
-				try {
-					const resume = received > 0;
-					const response = await fetch(name, resume ? { headers: { Range: 'bytes=' + received + '-' }, cache: 'no-store' } : {});
-					if (!response.ok) throw new Error('HTTP ' + response.status);
-					if (resume && response.status !== 206) {
-						// The range was ignored: start this part again.
-						packLoaded -= received;
-						received = 0;
-						chunks.length = 0;
-					}
-					const reader = response.body.getReader();
-					for (;;) {
-						const { done, value } = await reader.read();
-						if (done) break;
-						chunks.push(value);
-						received += value.length;
-						packLoaded += value.length;
-						report();
-					}
-					return chunks;
-				} catch (error) {
-					console.warn('Download of ' + name + ' interrupted at ' + received + ' bytes (attempt ' + attempt + '):', error);
-					if (attempt >= 8) throw new Error('Could not download ' + name + ': ' + error.message);
-					await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
-				}
-			}
-		}
-		const parts = HOSTED_PACK.parts.map(download);
+		const parts = HOSTED_PACK.parts.map((name) => hostedDownload(name, count));
 		for (const part of parts) {
 			for (const chunk of await part) await writer.write(chunk);
 		}
